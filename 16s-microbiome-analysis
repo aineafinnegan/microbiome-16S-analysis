@@ -1,0 +1,339 @@
+#===============================================
+# 16S rRNA Microbiome Analysis - DADA2 Pipeline
+# Gut microbiome profiling in pouchitis patients
+# Author: Áine Finnegan
+# Analysis: DADA2 sequence processing and phyloseq ecological analysis
+#===============================================
+
+# Load required libraries
+library(dada2)
+library(phyloseq)
+library(ggplot2)
+library(ape)
+library(dplyr)
+
+# Set path to working directory containing fastq files
+path <- "."
+
+# Verify files are present
+list.files()
+
+# Fix incorrectly named files (P5.T1.POU should be P5.T1.REC)
+file.rename("P5.T1.POU_1.fastq.gz", "P5.T1.REC_1.fastq.gz")
+file.rename("P5.T1.POU_2.fastq.gz", "P5.T1.REC_2.fastq.gz")
+
+#===============================================
+# 1. READ IN DATA AND CREATE MATCHED LISTS
+#===============================================
+
+# Forward and reverse fastq filenames have format: _1.fastq.gz or _2.fastq.gz
+fnFs <- sort(list.files(path, pattern="_1.fastq.gz", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_2.fastq.gz", full.names = TRUE))
+
+# Extract sample names
+sample.names <- sapply(strsplit(basename(fnFs), "_1\\.fastq\\.gz"), `[`, 1)
+
+#===============================================
+# 2. QUALITY FILTERING
+#===============================================
+
+# Place filtered files in filtered subdirectory
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+# Filter and trim reads
+# Truncate forward reads at 200bp, reverse at 150bp based on quality profiles
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, 
+                     truncLen=c(200,150),  
+                     maxN=0, maxEE=c(3,3),  
+                     truncQ=2, rm.phix=TRUE,
+                     compress=TRUE, multithread=FALSE)
+
+head(out)
+
+#===============================================
+# 3. LEARN ERROR RATES
+#===============================================
+
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+
+# Visualize estimated error rates
+plotErrors(errF, nominalQ=TRUE)
+
+#===============================================
+# 4. SAMPLE INFERENCE (DADA2 ALGORITHM)
+#===============================================
+
+# Infer sequence variants from forward reads
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+
+# Infer sequence variants from reverse reads
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+
+# Inspect results
+dadaFs[[1]]
+
+#===============================================
+# 5. MERGE PAIRED READS
+#===============================================
+
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+
+# Inspect merger data frame from first sample
+head(mergers[[1]])
+
+#===============================================
+# 6. CONSTRUCT SEQUENCE TABLE
+#===============================================
+
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+
+#===============================================
+# 7. REMOVE CHIMERAS
+#===============================================
+
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", 
+                                    multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+
+# Calculate proportion of reads retained after chimera removal
+sum(seqtab.nochim)/sum(seqtab)
+
+#===============================================
+# 8. TRACK READS THROUGH PIPELINE
+#===============================================
+
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), 
+               sapply(mergers, getN), rowSums(seqtab.nochim))
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+
+#===============================================
+# 9. ASSIGN TAXONOMY
+#===============================================
+
+# Assign taxonomy using Silva reference database
+# Note: Update path to your Silva database location
+taxa <- assignTaxonomy(seqtab.nochim, "path/to/silva_nr_v132_train_set.fa.gz", 
+                      multithread=TRUE)
+
+taxa.print <- taxa
+rownames(taxa.print) <- NULL
+head(taxa.print)
+
+#===============================================
+# 10. PREPARE METADATA FOR PHYLOSEQ
+#===============================================
+
+samples.out <- rownames(seqtab.nochim)
+
+# Extract metadata from sample names
+patient <- sapply(strsplit(samples.out, "\\."), `[`, 1)
+timepoint <- sapply(strsplit(samples.out, "\\."), `[`, 2)
+sample_type <- sapply(strsplit(samples.out, "\\."), `[`, 3)
+
+# Create metadata dataframe
+samdf <- data.frame(Patient=patient, Timepoint=timepoint, Sample_Type=sample_type)
+rownames(samdf) <- samples.out
+
+head(samdf)
+
+#===============================================
+# 11. CREATE PHYLOSEQ OBJECT
+#===============================================
+
+ps <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE),
+               sample_data(samdf),
+               tax_table(taxa))
+
+# Add pouchitis status to metadata
+sample_data_df <- data.frame(sample_data(ps))
+sample_data_df$Pouchitis_Status <- ifelse(sample_data_df$Patient %in% c("P2", "P5"), 
+                                          "Pouchitis", "No Pouchitis")
+sample_data(ps) <- sample_data(sample_data_df)
+
+# Add detailed biopsy site information
+sample_data_df$Site_Detail <- case_when(
+  grepl("T1.*ILEO", rownames(sample_data_df)) ~ "Ileum (stoma)",
+  grepl("T1.*REC", rownames(sample_data_df)) ~ "Rectum (diverted)",
+  grepl("T2.*ILEO", rownames(sample_data_df)) ~ "Ileum (stoma)",
+  grepl("T2.*POU", rownames(sample_data_df)) ~ "Pouch (defunctioned)",
+  grepl("TS.*ILEO", rownames(sample_data_df)) ~ "Ileum (pre-pouch)",
+  grepl("TS.*POU", rownames(sample_data_df)) ~ "Pouch",
+  TRUE ~ "Unknown"
+)
+sample_data(ps) <- sample_data(sample_data_df)
+
+#===============================================
+# 12. ALPHA DIVERSITY ANALYSIS
+#===============================================
+
+# Shannon diversity by patient and pouchitis status
+plot_richness(ps, x="Timepoint", color="Sample_Type", measures="Shannon") + 
+  facet_wrap(~Patient, scales="free") +
+  geom_line(aes(group=Sample_Type), linetype="solid") +
+  geom_point(aes(shape=Pouchitis_Status), size=3) +
+  theme_bw() +
+  scale_shape_manual(values = c("Pouchitis" = 17, "No Pouchitis" = 16)) +
+  labs(title = "Shannon Diversity", color = "Sample Type", shape = "Pouchitis Status")
+
+# Simpson diversity by patient and pouchitis status
+plot_richness(ps, x="Timepoint", color="Sample_Type", measures="Simpson") + 
+  facet_wrap(~Patient, scales="free") +
+  geom_line(aes(group=Sample_Type), linetype="solid") +
+  geom_point(aes(shape=Pouchitis_Status), size=3) +
+  theme_bw() +
+  scale_shape_manual(values = c("Pouchitis" = 17, "No Pouchitis" = 16)) +
+  labs(title = "Simpson Diversity", color = "Sample Type", shape = "Pouchitis Status")
+
+#===============================================
+# 13. BETA DIVERSITY - BRAY-CURTIS NMDS
+#===============================================
+
+# Transform to relative abundance
+ps.prop <- transform_sample_counts(ps, function(otu) otu/sum(otu))
+
+# NMDS ordination with Bray-Curtis distance
+ord.nmds.bray <- ordinate(ps.prop, method="NMDS", distance="bray")
+
+# Plot with ellipses by pouchitis status
+plot_ordination(ps.prop, ord.nmds.bray, color="Pouchitis_Status", shape="Site_Detail", 
+                title="NMDS Ordination - Bray-Curtis Distance") +
+  geom_point(size=4) +
+  stat_ellipse(aes(group=Pouchitis_Status), type="norm", level=0.95) +
+  theme_bw() +
+  labs(color = "Pouchitis Status", shape = "Biopsy Site Detail") +
+  scale_color_manual(values = c("Pouchitis" = "red", "No Pouchitis" = "blue"))
+
+#===============================================
+# 14. BETA DIVERSITY - UNIFRAC
+#===============================================
+
+# Build phylogenetic tree for UniFrac calculations
+random_tree <- rtree(ntaxa(ps.prop), tip.label = taxa_names(ps.prop))
+phy_tree(ps.prop) <- random_tree
+
+# Unweighted UniFrac PCoA
+ord.pcoa.unifrac.unweighted <- ordinate(ps.prop, method="PCoA", distance="unifrac")
+
+plot_ordination(ps.prop, ord.pcoa.unifrac.unweighted, color="Pouchitis_Status", 
+                shape="Site_Detail", title="PCoA - Unweighted UniFrac Distance") +
+  geom_point(size=4) +
+  stat_ellipse(aes(group=Pouchitis_Status), type="norm", level=0.95) +
+  theme_bw() +
+  labs(color = "Pouchitis Status", shape = "Biopsy Site Detail") +
+  scale_color_manual(values = c("Pouchitis" = "red", "No Pouchitis" = "blue"))
+
+# Weighted UniFrac PCoA
+ord.pcoa.unifrac.weighted <- ordinate(ps.prop, method="PCoA", distance="wunifrac")
+
+plot_ordination(ps.prop, ord.pcoa.unifrac.weighted, color="Pouchitis_Status", 
+                shape="Site_Detail", title="PCoA - Weighted UniFrac Distance") +
+  geom_point(size=4) +
+  stat_ellipse(aes(group=Pouchitis_Status), type="norm", level=0.95) +
+  theme_bw() +
+  labs(color = "Pouchitis Status", shape = "Biopsy Site Detail") +
+  scale_color_manual(values = c("Pouchitis" = "red", "No Pouchitis" = "blue"))
+
+#===============================================
+# 15. TAXONOMIC COMPOSITION - TOP 10 PHYLUM
+#===============================================
+
+ps.phylum <- tax_glom(ps.prop, "Phylum", NArm = TRUE)
+top10_phyla <- names(sort(taxa_sums(ps.phylum), decreasing = TRUE)[1:10])
+ps.phylum.top10 <- prune_taxa(top10_phyla, ps.phylum)
+
+phylum_df <- psmelt(ps.phylum.top10)
+phylum_df$Site_Detail <- case_when(
+  grepl("T1.*ILEO", phylum_df$Sample) ~ "Ileum (stoma)",
+  grepl("T1.*REC", phylum_df$Sample) ~ "Rectum (diverted)",
+  grepl("T2.*ILEO", phylum_df$Sample) ~ "Ileum (stoma)",
+  grepl("T2.*POU", phylum_df$Sample) ~ "Pouch (defunctioned)",
+  grepl("TS.*ILEO", phylum_df$Sample) ~ "Ileum (pre-pouch)",
+  grepl("TS.*POU", phylum_df$Sample) ~ "Pouch",
+  TRUE ~ "Unknown"
+)
+
+ggplot(phylum_df, aes(x = Site_Detail, y = Abundance, fill = Phylum)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~Patient, scales = "free_x", ncol = 3) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8)) +
+  labs(title = "Top 10 Phylum by Patient and Biopsy Site",
+       x = "Biopsy Site", y = "Relative Abundance") +
+  scale_fill_brewer(type = "qual", palette = "Set3")
+
+#===============================================
+# 16. TAXONOMIC COMPOSITION - TOP 10 FAMILY
+#===============================================
+
+ps.family <- tax_glom(ps.prop, "Family", NArm = TRUE)
+top10_families <- names(sort(taxa_sums(ps.family), decreasing = TRUE)[1:10])
+ps.family.top10 <- prune_taxa(top10_families, ps.family)
+
+family_df <- psmelt(ps.family.top10)
+family_df$Site_Detail <- case_when(
+  grepl("T1.*ILEO", family_df$Sample) ~ "Ileum (stoma)",
+  grepl("T1.*REC", family_df$Sample) ~ "Rectum (diverted)",
+  grepl("T2.*ILEO", family_df$Sample) ~ "Ileum (stoma)",
+  grepl("T2.*POU", family_df$Sample) ~ "Pouch (defunctioned)",
+  grepl("TS.*ILEO", family_df$Sample) ~ "Ileum (pre-pouch)",
+  grepl("TS.*POU", family_df$Sample) ~ "Pouch",
+  TRUE ~ "Unknown"
+)
+
+ggplot(family_df, aes(x = Site_Detail, y = Abundance, fill = Family)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~Patient, scales = "free_x", ncol = 3) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8)) +
+  labs(title = "Top 10 Family by Patient and Biopsy Site",
+       x = "Biopsy Site", y = "Relative Abundance") +
+  scale_fill_brewer(type = "qual", palette = "Set3")
+
+#===============================================
+# 17. TAXONOMIC COMPOSITION - TOP 10 GENUS
+#===============================================
+
+ps.genus <- tax_glom(ps.prop, "Genus", NArm = TRUE)
+top10_genera <- names(sort(taxa_sums(ps.genus), decreasing = TRUE)[1:10])
+ps.genus.top10 <- prune_taxa(top10_genera, ps.genus)
+
+genus_df <- psmelt(ps.genus.top10)
+
+# Create site detail mapping
+site_info <- data.frame(
+  Sample = samples.out,
+  Site_Detail = case_when(
+    grepl("T1.*ILEO", samples.out) ~ "Ileum (stoma)",
+    grepl("T1.*REC", samples.out) ~ "Rectum (diverted)",
+    grepl("T2.*ILEO", samples.out) ~ "Ileum (stoma)",
+    grepl("T2.*POU", samples.out) ~ "Pouch (defunctioned)",
+    grepl("TS.*ILEO", samples.out) ~ "Ileum (pre-pouch)",
+    grepl("TS.*POU", samples.out) ~ "Pouch",
+    TRUE ~ "Unknown"
+  )
+)
+
+genus_df <- merge(genus_df, site_info, by = "Sample")
+
+ggplot(genus_df, aes(x = Site_Detail, y = Abundance, fill = Genus)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~Patient, scales = "free_x", ncol = 3) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8)) +
+  labs(title = "Top 10 Genus by Patient and Biopsy Site",
+       x = "Biopsy Site", y = "Relative Abundance") +
+  scale_fill_brewer(type = "qual", palette = "Set3")
+
+print("Analysis complete")
